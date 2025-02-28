@@ -4,14 +4,62 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "deps/tiny_gltf.h"
+#include "deps/picojson.h"
 
+#include <map>
 #include <vsg/all.h>
 #include "gltf.h"
 using namespace vsgRecipes;
 
-extern vsg::ref_ptr<vsg::Object> loadGltfScene(tinygltf::Model& modelDef,
-                                               vsg::ref_ptr<const vsg::Options> opt);
-gltf::gltf() : _supportedExtensions{ ".gltf", ".glb" }{}
+static std::string trimString(const std::string& str)
+{
+    if (!str.size()) return str;
+    std::string::size_type first = str.find_first_not_of(" \t");
+    std::string::size_type last = str.find_last_not_of("  \t\r\n");
+    if ((first == str.npos) || (last == str.npos)) return std::string("");
+    return str.substr(first, last - first + 1);
+}
+
+static vsg::dvec3 readRtcCenterFeatureTable(const std::vector<uint8_t>& data, int offset, int size)
+{
+    std::string json; json.assign(data.begin() + offset, data.begin() + size + offset);
+    picojson::value root; std::string err = picojson::parse(root, json);
+    if (err.empty() && root.contains("RTC_CENTER"))
+    {
+        picojson::value center = root.get<picojson::object>().at("RTC_CENTER");
+        if (center.is<picojson::array>())
+        {
+            picojson::array cValues = center.get<picojson::array>();
+            if (cValues.size() > 2) return vsg::dvec3(
+                cValues[0].get<double>(), cValues[2].get<double>(), -cValues[1].get<double>());
+        }
+    }
+    return vsg::dvec3();
+}
+
+static unsigned int readB3dmHeader(const std::vector<uint8_t>& data, vsg::dvec3* rtcCenter = NULL)
+{
+    // https://github.com/CesiumGS/3d-tiles/blob/main/specification/TileFormats/Batched3DModel/README.adoc#tileformats-batched3dmodel-batched-3d-model
+    // magic + version + length + featureTableJsonLength + featureTableBinLength +
+    // batchTableJsonLength + batchTableBinLength + <Real feature table> + <Real batch table> + GLTF body
+    int header[7], hSize = 7 * sizeof(int); memcpy(header, data.data(), hSize);
+    if (rtcCenter && header[3] > 0) *rtcCenter = readRtcCenterFeatureTable(data, hSize, header[3]);
+    return hSize + header[3] + header[4] + header[5] + header[6];
+}
+
+static unsigned int readI3dmHeader(const std::vector<uint8_t>& data, unsigned int& format)
+{
+    // https://github.com/CesiumGS/3d-tiles/blob/main/specification/TileFormats/Instanced3DModel/README.adoc#tileformats-instanced3dmodel-instanced-3d-model
+    // magic + version + length + featureTableJsonLength + featureTableBinLength +
+    // batchTableJsonLength + batchTableBinLength + gltfFormat +
+    // <Real feature table> + <Real batch table> + GLTF body
+    int header[8]; memcpy(header, data.data(), 8 * sizeof(int)); format = header[7];
+    return 8 * sizeof(int) + header[3] + header[4] + header[5] + header[6];
+}
+
+extern vsg::ref_ptr<vsg::Object> loadGltfScene(tinygltf::Model& modelDef, vsg::ref_ptr<const vsg::Options> opt,
+                                               const vsg::dvec3& rtcCenter = vsg::dvec3());
+gltf::gltf() : _supportedExtensions{ ".gltf", ".glb", ".b3dm", ".i3dm" } {}
 gltf::~gltf() {}
 
 vsg::ref_ptr<vsg::Object> gltf::read(const vsg::Path& path, vsg::ref_ptr<const vsg::Options> opt) const
@@ -22,16 +70,25 @@ vsg::ref_ptr<vsg::Object> gltf::read(const vsg::Path& path, vsg::ref_ptr<const v
     if (!fileName) return {};
 
     tinygltf::TinyGLTF loader; std::string err, warn;
+    loader.SetStoreOriginalJSONForExtrasAndExtensions(true);
+
     vsg::Path ext = vsg::fileExtension(fileName);
     if (ext == ".gltf")
     {
         bool loaded = loader.LoadASCIIFromFile(&modelDef, &err, &warn, fileName.string());
         return loaded ? loadGltfScene(modelDef, opt) : nullptr;
     }
-    else //if (ext == ".glb")
+    else if (ext == ".glb")
     {
         bool loaded = loader.LoadBinaryFromFile(&modelDef, &err, &warn, fileName.string());
         return loaded ? loadGltfScene(modelDef, opt) : nullptr;
+    }
+    else
+    {
+        std::istreambuf_iterator<char> eos;
+        std::ifstream in(fileName.string(), std::ios::in | std::ios::binary);
+        std::vector<char> data(std::istreambuf_iterator<char>(in), eos);
+        return readTileData(std::vector<uint8_t>(data.begin(), data.end()), opt);
     }
 }
 
@@ -43,6 +100,8 @@ vsg::ref_ptr<vsg::Object> gltf::read(std::istream& in, vsg::ref_ptr<const vsg::O
     if (!vsg::compatibleExtension(opt, _supportedExtensions) || !size) return {};
 
     tinygltf::TinyGLTF loader; std::string err, warn;
+    loader.SetStoreOriginalJSONForExtrasAndExtensions(true);
+
     vsg::Path ext = opt.valid() ? opt->extensionHint : "";
     vsg::Path dir = opt.valid() ? (opt->paths.empty() ? "." : opt->paths.back()) : ".";
     if (ext == ".gltf")
@@ -50,10 +109,16 @@ vsg::ref_ptr<vsg::Object> gltf::read(std::istream& in, vsg::ref_ptr<const vsg::O
         bool loaded = loader.LoadASCIIFromString(&modelDef, &err, &warn, &data[0], size, dir.string());
         return loaded ? loadGltfScene(modelDef, opt) : nullptr;
     }
-    else //if (ext == ".glb")
+    else if (ext == ".glb")
     {
         bool loaded = loader.LoadBinaryFromMemory(&modelDef, &err, &warn, (uint8_t*)&data[0], size, dir.string());
         return loaded ? loadGltfScene(modelDef, opt) : nullptr;
+    }
+    else
+    {
+        std::istreambuf_iterator<char> eos;
+        std::vector<char> data(std::istreambuf_iterator<char>(in), eos);
+        return readTileData(std::vector<uint8_t>(data.begin(), data.end()), opt);
     }
 }
 
@@ -64,6 +129,8 @@ vsg::ref_ptr<vsg::Object> gltf::read(const uint8_t* ptr, size_t size,
     if (!vsg::compatibleExtension(opt, _supportedExtensions) || !size) return {};
 
     tinygltf::TinyGLTF loader; std::string err, warn;
+    loader.SetStoreOriginalJSONForExtrasAndExtensions(true);
+
     vsg::Path ext = opt.valid() ? opt->extensionHint : "";
     vsg::Path dir = opt.valid() ? (opt->paths.empty() ? "." : opt->paths.back()) : ".";
     if (ext == ".gltf")
@@ -71,11 +138,62 @@ vsg::ref_ptr<vsg::Object> gltf::read(const uint8_t* ptr, size_t size,
         bool loaded = loader.LoadASCIIFromString(&modelDef, &err, &warn, (char*)ptr, (unsigned int)size, dir.string());
         return loaded ? loadGltfScene(modelDef, opt) : nullptr;
     }
-    else //if (ext == ".glb")
+    else if (ext == ".glb")
     {
         bool loaded = loader.LoadBinaryFromMemory(&modelDef, &err, &warn, ptr, (unsigned int)size, dir.string());
         return loaded ? loadGltfScene(modelDef, opt) : nullptr;
     }
+    else
+        return readTileData(std::vector<uint8_t>(ptr, ptr + size), opt);
+}
+
+vsg::ref_ptr<vsg::Object> gltf::readTileData(const std::vector<uint8_t>& data,
+                                             vsg::ref_ptr<const vsg::Options> opt) const
+{
+    unsigned int version = 2, offset = 0, format = 0, dataSize = (unsigned int)data.size();
+    vsg::dvec3 rtcCenter; std::string externalFileURI;
+
+    vsg::Path dir = opt.valid() ? (opt->paths.empty() ? "." : opt->paths.back()) : ".";
+    if (dataSize > 4)
+    {
+        if (data[0] == 'b' && data[1] == '3' && data[2] == 'd' && data[3] == 'm')
+        {
+            offset = readB3dmHeader(data, &rtcCenter);
+            memcpy(&version, &data[0] + offset + 4, 4); tinygltf::swap4(&version);
+        }
+        else if (data[0] == 'i' && data[1] == '3' && data[2] == 'd' && data[3] == 'm')
+        {
+            offset = readI3dmHeader(data, format);
+            if (format == 0)  // URL
+            {
+                std::vector<char> uri(dataSize - offset);
+                memcpy(&uri[0], &data[0] + offset, uri.size()); char* p = &uri[0];
+                externalFileURI = std::string(p, p + uri.size());
+            }
+            else  // Raw GLTF data
+                memcpy(&version, &data[0] + offset + 4, 4); tinygltf::swap4(&version);
+        }
+    }
+
+    tinygltf::TinyGLTF loader; std::string err, warn;
+    loader.SetStoreOriginalJSONForExtrasAndExtensions(true);
+
+    tinygltf::Model modelDef;
+    if (!externalFileURI.empty())
+    {
+        vsg::Path fileName(dir.string() + "/" + trimString(externalFileURI));
+        vsg::Path ext = vsg::fileExtension(fileName);
+        bool loaded = (ext == "glb") ? loader.LoadBinaryFromFile(&modelDef, &err, &warn, fileName.string())
+                                     : loader.LoadASCIIFromFile(&modelDef, &err, &warn, fileName.string());
+        return loaded ? loadGltfScene(modelDef, opt, rtcCenter) : nullptr;
+    }
+    else if (version >= 2)
+    {
+        bool loaded = loader.LoadBinaryFromMemory(
+            &modelDef, &err, &warn, (unsigned char*)&data[0] + offset, dataSize - offset, dir.string());
+        return loaded ? loadGltfScene(modelDef, opt, rtcCenter) : nullptr;
+    }
+    return nullptr;
 }
 
 bool gltf::getFeatures(Features& features) const
@@ -96,6 +214,31 @@ bool gltf::readOptions(vsg::Options& options, vsg::CommandLine& arguments) const
 class GltfImplementation
 {
 public:
+    struct JointAndWeightCollector
+    {
+        std::vector<unsigned char> joints0;
+        std::vector<unsigned short> joints1;
+        std::vector<float> weights;
+    };
+
+    struct MeshSkinnigData
+    {
+        // Every vertex of a mesh has N joint-weight pairs, with total weight = 1
+        typedef std::pair<int, float> JointWeightPair;
+        typedef std::vector<JointWeightPair> JointWeightList;
+        std::vector<JointWeightList> perVecWeights;         // size equals to vertex count
+        std::map<int, vsg::mat4> invBindPoseMap;            // joint inverse bindpose
+    };
+
+    struct CharacterData
+    {
+        std::vector<int> joints;
+        std::vector<vsg::Object*> meshList;
+        std::map<vsg::Object*, MeshSkinnigData> skinningMap;
+        int skeletonBaseIndex, invBindPoseAccessor;
+        CharacterData() : skeletonBaseIndex(-1), invBindPoseAccessor(-1) {}
+    };
+
     GltfImplementation(tinygltf::Model* model, vsg::ref_ptr<const vsg::Options> opt)
         : _model(model), _options(opt)
     {
@@ -103,14 +246,106 @@ public:
         if (!_sharedObjects) _sharedObjects = vsg::SharedObjects::create();
     }
 
-    vsg::ref_ptr<vsg::Group> load(int sceneID)
+    vsg::ref_ptr<vsg::Group> load(int sceneID, const vsg::dvec3& rtcCenter)
     {
+        vsg::ref_ptr<vsg::Group> root;
         const tinygltf::Scene& defScene = _model->scenes[sceneID];
-        vsg::ref_ptr<vsg::Group> root = vsg::Group::create();
+
+        // Handle Cesium center parameter if exists
+        if (vsg::length2(rtcCenter) > 0.0)
+            root = vsg::MatrixTransform::create(vsg::translate(rtcCenter));
+        else if (!_model->extensions.empty() &&
+                  _model->extensions.find("CESIUM_RTC") != _model->extensions.end())
+        {
+            if (_model->extensions["CESIUM_RTC"].Has("center"))
+            {
+                const tinygltf::Value& center = _model->extensions["CESIUM_RTC"].Get("center");
+                if (center.IsArray())
+                {
+                    const tinygltf::Value::Array& cData = center.Get<tinygltf::Value::Array>();
+                    if (cData.size() > 2)
+                    {
+                        vsg::dvec3 rtcCenter2(cData[0].GetNumberAsDouble(),
+                                              cData[2].GetNumberAsDouble(), -cData[1].GetNumberAsDouble());
+                        root = vsg::MatrixTransform::create(vsg::translate(rtcCenter2));
+                    }
+                }
+            }
+        }
+
+        // Pre-load skinning data
+        for (size_t i = 0; i < _model->skins.size(); ++i)
+        {
+            CharacterData sd;
+            const tinygltf::Skin& skin = _model->skins[i];
+            sd.skeletonBaseIndex = skin.skeleton;
+            sd.invBindPoseAccessor = skin.inverseBindMatrices;
+            sd.joints.assign(skin.joints.begin(), skin.joints.end());
+            _characterDataList.push_back(sd);
+        }
+
+        // Add mesh and node data
+        if (!root) root = vsg::Group::create();
         for (size_t i = 0; i < defScene.nodes.size(); ++i)
         {
             vsg::ref_ptr<vsg::Node> node = loadNode(defScene.nodes[i]);
             if (node.valid()) root->addChild(node);
+        }
+
+        // Configure skinning data
+        for (size_t i = 0; i < _characterDataList.size(); ++i)
+        {
+            CharacterData& sd = _characterDataList[i];
+            createInvBindMatrices(sd, _model->accessors[sd.invBindPoseAccessor]);
+            // TODO: add to vsg joint nodes...
+        }
+
+        // Add animation data
+        for (size_t i = 0; i < _model->animations.size(); ++i)
+        {
+            tinygltf::Animation& anim = _model->animations[i];
+            std::string animName = anim.name;
+            if (animName.empty()) animName = "Take001";
+            int belongsToSkeleton = -1;
+
+            // Check if animation belongs to certain skeleton
+            typedef std::pair<std::string, int> PathAndSampler;
+            std::map<int, std::vector<PathAndSampler>> samplers;
+            for (size_t j = 0; j < anim.channels.size(); ++j)
+            {
+                tinygltf::AnimationChannel& ch = anim.channels[j];
+                if (ch.sampler < 0 || ch.target_node < 0) continue;
+                
+                samplers[ch.target_node].push_back(PathAndSampler(ch.target_path, ch.sampler));
+                for (size_t k = 0; k < _characterDataList.size(); ++k)
+                {
+                    std::vector<int>& joints = _characterDataList[k].joints;
+                    if (std::find(joints.begin(), joints.end(), ch.target_node) != joints.end())
+                    { belongsToSkeleton = k; break; }
+                }
+            }
+
+            // Save animation path data
+            for (std::map<int, std::vector<PathAndSampler>>::iterator itr = samplers.begin();
+                 itr != samplers.end(); ++itr)
+            {
+                std::vector<PathAndSampler>& pathList = itr->second;
+                for (size_t j = 0; j < pathList.size(); ++j)
+                {
+                    tinygltf::AnimationSampler& sp = anim.samplers[pathList[j].second];
+                    if (sp.input < 0 || sp.output < 0) continue;
+                    // TODO
+                }
+            }
+
+            if (belongsToSkeleton >= 0)
+            {
+                // TODO: skeleton animation
+            }
+            else
+            {
+                // TODO: normal animation
+            }
         }
         return root->children.empty() ? nullptr : root;
     }
@@ -157,6 +392,7 @@ public:
     vsg::ref_ptr<vsg::Node> loadMeshData(int meshID, int skinID)
     {
         tinygltf::Mesh& gltfMesh = _model->meshes[meshID];
+        CharacterData* sd = (skinID < 0) ? nullptr : &_characterDataList[skinID];
         if (_meshes.find(meshID) != _meshes.end()) return _meshes[meshID];
 
         vsg::ref_ptr<vsg::Group> meshRoot = vsg::Group::create();
@@ -165,14 +401,16 @@ public:
         {
             tinygltf::Primitive gltfPrimitive = gltfMesh.primitives[i];
             vsg::ref_ptr<vsg::DescriptorConfigurator> material = loadMaterial(gltfPrimitive.material);
-
             vsg::DataList vertexArrayData;
+            JointAndWeightCollector jwData;
+
             vsg::ref_ptr<vsg::GraphicsPipelineConfigurator> config =
                 vsg::GraphicsPipelineConfigurator::create(material->shaderSet);
             config->descriptorConfigurator = material;
             if (_options.valid()) config->assignInheritedState(_options->inheritedState);
 
-            bool hasNormals = false, hasColors = false, hasUVs = false;
+            bool hasNormals = false, hasColors = false, hasTangents = false, hasUVs = false;
+            unsigned int vertexCount = 0;
             for (std::map<std::string, int>::iterator attrib = gltfPrimitive.attributes.begin();
                  attrib != gltfPrimitive.attributes.end(); ++attrib)
             {
@@ -193,6 +431,7 @@ public:
                     vsg::ref_ptr<vsg::vec3Array> va = vsg::vec3Array::create(size);
                     copyBufferData(va->dataPointer(), &gltfBuffer.data[offset], copySize, stride, size);
                     config->assignArray(vertexArrayData, "vsg_Vertex", VK_VERTEX_INPUT_RATE_VERTEX, va);
+                    vertexCount += size;
                 }
                 else if (attrib->first.compare("NORMAL") == 0 && compSize == 4 && compNum == 3)
                 {
@@ -207,6 +446,13 @@ public:
                     copyBufferData(ca->dataPointer(), &gltfBuffer.data[offset], copySize, stride, size);
                     config->assignArray(vertexArrayData, "vsg_Color", VK_VERTEX_INPUT_RATE_VERTEX, ca);
                     hasColors = true;
+                }
+                else if (attrib->first.compare("TANGENT") == 0 && compSize == 4 && compNum == 4)
+                {
+                    vsg::ref_ptr<vsg::vec4Array> ta = vsg::vec4Array::create(size);
+                    copyBufferData(ta->dataPointer(), &gltfBuffer.data[offset], copySize, stride, size);
+                    config->assignArray(vertexArrayData, "vsg_Tangent", VK_VERTEX_INPUT_RATE_VERTEX, ta);
+                    hasTangents = true;
                 }
                 else if (attrib->first.find("TEXCOORD_") != std::string::npos && compSize == 4 && compNum == 2)
                 {
@@ -224,14 +470,28 @@ public:
                 else if (attrib->first.find("JOINTS_") != std::string::npos && compNum == 4)
                 {
                     int jointID = atoi(attrib->first.substr(7).c_str());
-                    // TODO
-                    vsg::warn("[loadMeshData] Not implemented: read joints");
+                    if (jointID == 0)  // FIXME: joints group > 0?
+                    {
+                        if (compSize == 1)
+                        {
+                            jwData.joints0.resize(size * compNum);
+                            copyBufferData(&(jwData.joints0[0]), &gltfBuffer.data[offset], copySize, stride, size);
+                        }
+                        else
+                        {
+                            jwData.joints1.resize(size * compNum);
+                            copyBufferData(&(jwData.joints1[0]), &gltfBuffer.data[offset], copySize, stride, size);
+                        }
+                    }
                 }
                 else if (attrib->first.find("WEIGHTS_") != std::string::npos && compSize == 4 && compNum == 4)
                 {
                     int weightID = atoi(attrib->first.substr(8).c_str());
-                    // TODO
-                    vsg::warn("[loadMeshData] Not implemented: read weights");
+                    if (weightID == 0)  // FIXME: weights group > 0?
+                    {
+                        jwData.weights.resize(size * compNum);
+                        copyBufferData(&(jwData.weights[0]), &gltfBuffer.data[offset], copySize, stride, size);
+                    }
                 }
             }
 
@@ -252,25 +512,62 @@ public:
                 config->assignArray(vertexArrayData, "vsg_TexCoord0", VK_VERTEX_INPUT_RATE_INSTANCE, ta);
             }
 
+            // Check topology
+            VkPrimitiveTopology topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            switch (gltfPrimitive.mode)
+            {
+            case TINYGLTF_MODE_POINTS:
+                topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
+            case TINYGLTF_MODE_LINE:
+                topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+            case TINYGLTF_MODE_LINE_LOOP:
+                topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;  // FIXME
+            case TINYGLTF_MODE_LINE_STRIP:
+                topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
+            case TINYGLTF_MODE_TRIANGLES:
+                topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
+            case TINYGLTF_MODE_TRIANGLE_STRIP:
+                topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
+            case TINYGLTF_MODE_TRIANGLE_FAN:
+                topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
+            default: break;
+            }
+
+            // Set the GraphicsPipelineStates to the required values
+            struct SetPipelineStates : public vsg::Visitor
+            {
+                VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+                bool blending = false, two_sided = false;
+                SetPipelineStates(VkPrimitiveTopology in_topology, bool in_blending, bool in_two_sided)
+                    : topology(in_topology), blending(in_blending), two_sided(in_two_sided) {}
+
+                void apply(vsg::Object& object) { object.traverse(*this); }
+                void apply(vsg::RasterizationState& rs) { if (two_sided) rs.cullMode = VK_CULL_MODE_NONE; }
+                void apply(vsg::InputAssemblyState& ias) { ias.topology = topology; }
+                void apply(vsg::ColorBlendState& cbs) { cbs.configureAttachments(blending); }
+            } sps(topology, material->blending, material->two_sided);
+
+            config->accept(sps);
+            if (!_sharedObjects) config->init();
+            else _sharedObjects->share(config, [](auto gpc) { gpc->init(); });
+
+            // Create StateGroup as the root of the scene/command graph to hold the GraphicsPipeline
+            vsg::ref_ptr<vsg::StateGroup> stateGroup = vsg::StateGroup::create();
+            config->copyTo(stateGroup, _sharedObjects);
+
             // Configure primitive index array
+            vsg::ref_ptr<vsg::Data> indices;
             tinygltf::Accessor indexAccessor = _model->accessors[gltfPrimitive.indices];
             const tinygltf::BufferView& indexView = _model->bufferViews[indexAccessor.bufferView];
-
-            vsg::ref_ptr<vsg::Data> indices;
-            if (indexView.target == 0)
-            {
-                // TODO
-                vsg::warn("[loadMeshData] Not implemented: ignore index array");
-            }
-            else  // ELEMENT_ARRAY_BUFFER = 34963
+            if (indexView.target != 0)  // ELEMENT_ARRAY_BUFFER = 34963
             {
                 const tinygltf::Buffer& indexBuffer = _model->buffers[indexView.buffer];
                 int compSize = tinygltf::GetComponentSizeInBytes(indexAccessor.componentType);
                 int size = (int)indexAccessor.count; if (!size) continue;
                 size_t stride = (indexView.byteStride > 0 && indexView.byteStride != compSize)
                               ? indexView.byteStride : 0;
-
                 size_t offset = indexView.byteOffset + indexAccessor.byteOffset;
+
                 switch (compSize)
                 {
                 case 1:
@@ -300,60 +597,32 @@ public:
                 }
             }
 
-            VkPrimitiveTopology topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-            switch (gltfPrimitive.mode)
+            // Apply drawer to state group
+            vsg::ComputeBounds computeBounds;
+            if (!indices)
             {
-            case TINYGLTF_MODE_POINTS:
-                topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
-            case TINYGLTF_MODE_LINE:
-                topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
-            case TINYGLTF_MODE_LINE_LOOP:
-                topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;  // FIXME
-            case TINYGLTF_MODE_LINE_STRIP:
-                topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
-            case TINYGLTF_MODE_TRIANGLES:
-                topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
-            case TINYGLTF_MODE_TRIANGLE_STRIP:
-                topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
-            case TINYGLTF_MODE_TRIANGLE_FAN:
-                topology = VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
-            default: break;
+                vsg::ref_ptr<vsg::VertexDraw> drawer = vsg::VertexDraw::create();
+                drawer->setValue("name", gltfMesh.name + "_" + std::to_string(i));
+                drawer->assignArrays(vertexArrayData);
+                drawer->vertexCount = vertexCount;
+                drawer->instanceCount = 1;
+                drawer->accept(computeBounds);
+                stateGroup->addChild(drawer);
             }
-
-            if (!indices) continue;
-            vsg::ref_ptr<vsg::VertexIndexDraw> drawer = vsg::VertexIndexDraw::create();
-            drawer->setValue("name", gltfMesh.name + "_" + std::to_string(i));
-            drawer->assignArrays(vertexArrayData);
-            drawer->assignIndices(indices);
-            drawer->indexCount = static_cast<uint32_t>(indices->valueCount());
-            drawer->instanceCount = 1;
-
-            // set the GraphicsPipelineStates to the required values
-            struct SetPipelineStates : public vsg::Visitor
+            else
             {
-                VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-                bool blending = false, two_sided = false;
-                SetPipelineStates(VkPrimitiveTopology in_topology, bool in_blending, bool in_two_sided)
-                    : topology(in_topology), blending(in_blending), two_sided(in_two_sided) {}
-
-                void apply(vsg::Object& object) { object.traverse(*this); }
-                void apply(vsg::RasterizationState& rs) { if (two_sided) rs.cullMode = VK_CULL_MODE_NONE; }
-                void apply(vsg::InputAssemblyState& ias) { ias.topology = topology; }
-                void apply(vsg::ColorBlendState& cbs) { cbs.configureAttachments(blending); }
-            } sps(topology, material->blending, material->two_sided);
-
-            config->accept(sps);
-            if (!_sharedObjects) config->init();
-            else _sharedObjects->share(config, [](auto gpc) { gpc->init(); });
-
-            // create StateGroup as the root of the scene/command graph to hold the GraphicsPipeline
-            vsg::ref_ptr<vsg::StateGroup> stateGroup = vsg::StateGroup::create();
-            config->copyTo(stateGroup, _sharedObjects);
-            stateGroup->addChild(drawer);
+                vsg::ref_ptr<vsg::VertexIndexDraw> drawer = vsg::VertexIndexDraw::create();
+                drawer->setValue("name", gltfMesh.name + "_" + std::to_string(i));
+                drawer->assignArrays(vertexArrayData);
+                drawer->assignIndices(indices);
+                drawer->indexCount = static_cast<uint32_t>(indices->valueCount());
+                drawer->instanceCount = 1;
+                drawer->accept(computeBounds);
+                stateGroup->addChild(drawer);
+            }
 
             if (material->blending)
             {
-                vsg::ComputeBounds computeBounds; drawer->accept(computeBounds);
                 vsg::dvec3 center = (computeBounds.bounds.min + computeBounds.bounds.max) * 0.5;
                 double radius = vsg::length(computeBounds.bounds.max - computeBounds.bounds.min) * 0.5;
 
@@ -365,8 +634,54 @@ public:
             }
             else
                 meshRoot->addChild(stateGroup);
+
+            // Handle skinning data
+            if (sd != NULL && !jwData.weights.empty())
+            {
+                MeshSkinnigData skinningData;
+                int jointCount = (int)sd->joints.size();
+                for (size_t w = 0; w < jwData.weights.size(); w += 4)
+                {
+                    MeshSkinnigData::JointWeightList jwResultList;
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        int jID = jwData.joints0.empty()
+                                  ? (int)jwData.joints1[w + k] : (int)jwData.joints0[w + k];
+                        if (jID < 0 || jID >= jointCount)
+                        {
+                            vsg::warn("Invalid joint index ", jID, " for weight index ", (w + k));
+                            continue;
+                        }
+                        jwResultList.push_back(
+                            MeshSkinnigData::JointWeightPair(sd->joints[jID], jwData.weights[w + k]));
+                    }
+                    skinningData.perVecWeights.push_back(jwResultList);
+                }
+
+                if (skinningData.perVecWeights.size() != vertexCount)
+                {
+                    vsg::warn("Weight data size ", skinningData.perVecWeights.size(), " should be equal to vertex count ",
+                              vertexCount, "; Otherwise the skinning job may fail");
+                }
+                sd->skinningMap[meshRoot.get()] = skinningData;
+                sd->meshList.push_back(meshRoot.get());
+            }
+
+            // Handle blendshapes
+            for (size_t j = 0; j < gltfPrimitive.targets.size(); ++j)
+            {
+                // TODO
+            }
+        }  // for (size_t i = 0; i < gltfMesh.primitives.size(); ++i)
+
+        // Configure blendshape names
+        if (!gltfMesh.weights.empty())
+        {
+            const tinygltf::Value& names = gltfMesh.extras.Has("targetNames")
+                                         ? gltfMesh.extras.Get("targetNames") : tinygltf::Value();
+            // TODO
         }
-        return (meshRoot->children.size() == 1) ? meshRoot->children[0] : meshRoot;
+        return meshRoot;
     }
 
     vsg::ref_ptr<vsg::DescriptorConfigurator> loadMaterial(int mtlID)
@@ -519,6 +834,34 @@ public:
         material->assignTexture(name, data, sampler);
     }
 
+    bool createInvBindMatrices(CharacterData& sd, tinygltf::Accessor& accessor)
+    {
+        const tinygltf::BufferView& attrView = _model->bufferViews[accessor.bufferView];
+        if (attrView.buffer < 0) return false;
+
+        const tinygltf::Buffer& buffer = _model->buffers[attrView.buffer];
+        int compSize = tinygltf::GetComponentSizeInBytes(accessor.componentType);
+        int compNum = accessor.type, size = (int)accessor.count;
+        if (compNum != TINYGLTF_TYPE_MAT4) return false;
+
+        size_t stride = (attrView.byteStride > 0 && attrView.byteStride != (compSize * 4 * sizeof(float)))
+                      ? attrView.byteStride : 0;
+        size_t offset = accessor.byteOffset + attrView.byteOffset, matSize = compSize * 4;
+        std::vector<float> matrices(size * matSize);
+        copyBufferData(&matrices[0], &buffer.data[offset], matrices.size() * sizeof(float), stride, size);
+
+        for (int i = 0; i < size; ++i)
+        {
+            vsg::mat4 matrix(&matrices[i * matSize]);
+            for (size_t j = 0; j < sd.meshList.size(); ++j)
+            {
+                MeshSkinnigData& skinningMap = sd.skinningMap[sd.meshList[j]];
+                skinningMap.invBindPoseMap[i] = matrix;
+            }
+        }
+        return true;
+    }
+
     VkFilter getFilterMode(int filter, VkSamplerMipmapMode& mipmap) const
     {
         switch (filter)
@@ -581,12 +924,14 @@ protected:
     vsg::ref_ptr<vsg::ShaderSet> _pbrShaderSet;
     vsg::ref_ptr<vsg::ShaderSet> _phongShaderSet;
     vsg::ref_ptr<vsg::SharedObjects> _sharedObjects;
+    std::vector<CharacterData> _characterDataList;
     std::map<int, vsg::ref_ptr<vsg::DescriptorConfigurator>> _materials;
     std::map<int, vsg::ref_ptr<vsg::Node>> _meshes;
 };
 
-vsg::ref_ptr<vsg::Object> loadGltfScene(tinygltf::Model& modelDef, vsg::ref_ptr<const vsg::Options> opt)
+vsg::ref_ptr<vsg::Object> loadGltfScene(tinygltf::Model& modelDef, vsg::ref_ptr<const vsg::Options> opt,
+                                        const vsg::dvec3& rtcCenter)
 {
     GltfImplementation implementation(&modelDef, opt);
-    return implementation.load(modelDef.defaultScene);
+    return implementation.load(modelDef.defaultScene, rtcCenter);
 }

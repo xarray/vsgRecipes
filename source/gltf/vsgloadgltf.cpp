@@ -56,7 +56,6 @@ int main(int argc, char** argv)
     vsg::ref_ptr<vsg::Group> group = vsg::Group::create();
     for (int i = 1; i < argc; ++i)
     {
-        vsg::Path filename = vsg::filePath(arguments[i]);
         vsg::ref_ptr<vsg::Object> object = vsg::read(arguments[i], options);
         if (vsg::ref_ptr<vsg::Node> node = object.cast<vsg::Node>())
             group->addChild(node);
@@ -66,7 +65,7 @@ int main(int argc, char** argv)
                 group->addChild(textureQuad);
         }
         else
-            std::cout << "Unable to load file " << filename << std::endl;
+            std::cout << "Unable to load file " << arguments[i] << std::endl;
     }
 
     if (group->children.empty())
