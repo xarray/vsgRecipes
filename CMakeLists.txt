@@ -41,4 +41,5 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/data/ DESTINATION share/vsgRecipes
 
 # VSG recipes
 add_subdirectory(source/gltf)
+add_subdirectory(source/3dgs)
 vsg_add_feature_summary()

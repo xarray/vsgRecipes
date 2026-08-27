@@ -116,8 +116,8 @@ vsg::ref_ptr<vsg::Object> gltf::read(std::istream& in, vsg::ref_ptr<const vsg::O
     }
     else
     {
-        std::istreambuf_iterator<char> eos;
-        std::vector<char> data(std::istreambuf_iterator<char>(in), eos);
+        std::istreambuf_iterator<char> eos2;
+        std::vector<char> data(std::istreambuf_iterator<char>(in), eos2);
         return readTileData(std::vector<uint8_t>(data.begin(), data.end()), opt);
     }
 }
@@ -821,7 +821,7 @@ public:
         sampler->minFilter = getFilterMode(gltfSampler.minFilter, sampler->mipmapMode);
         sampler->anisotropyEnable = VK_TRUE;
         sampler->maxAnisotropy = 16.0f;
-        sampler->maxLod = data->properties.maxNumMipmaps;
+        //sampler->maxLod = data->properties.maxNumMipmaps;
 
         if (sampler->maxLod <= 1.0)
         {
