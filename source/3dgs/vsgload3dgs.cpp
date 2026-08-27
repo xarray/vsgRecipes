@@ -85,7 +85,10 @@ int main(int argc, char** argv)
     auto windowTraits = vsg::WindowTraits::create();
     windowTraits->width = 1024;
     windowTraits->height = 768;
-    windowTraits->windowTitle = "vsg 3DGS: " + filename;
+    windowTraits->windowTitle = "vsg 3dgs: " + filename;
+    windowTraits->swapchainPreferences.surfaceFormat =
+        VkSurfaceFormatKHR{ VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
+
     auto window = vsg::Window::create(windowTraits);
     if (!window)
     {
@@ -125,9 +128,8 @@ int main(int argc, char** argv)
     viewer->addEventHandler(vsg::CloseHandler::create(viewer));
 
     // render loop
-    const vsg::dmat4 modelMatrix; // identity
+    const vsg::dmat4 modelMatrix;
     vsg::ivec2 screenSize(window->extent2D().width, window->extent2D().height);
-
     while (viewer->advanceToNextFrame())
     {
         viewer->handleEvents();
